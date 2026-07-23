@@ -14,6 +14,36 @@ let
   ];
   stringify = value: if builtins.isBool value then lib.boolToString value else toString value;
   environment = lib.mapAttrs (_: stringify) cfg.settings;
+  defaultSandboxImage = pkgs.callPackage ./sandbox-image.nix { };
+  podmanAsDocker = pkgs.writeShellScriptBin "docker" ''
+    runtime_dir="/run/user/$(${pkgs.coreutils}/bin/id -u)"
+    # The remote client still creates a small libpod runtime directory. Keep it
+    # in the service's private /tmp so /run/user can remain read-only.
+    export XDG_RUNTIME_DIR="''${TMPDIR:-/tmp}/marimohub-podman"
+    ${pkgs.coreutils}/bin/mkdir -p "$XDG_RUNTIME_DIR"
+    ${pkgs.coreutils}/bin/chmod 0700 "$XDG_RUNTIME_DIR"
+    exec ${lib.getExe cfg.podman.package} \
+      --remote --url "unix://$runtime_dir/podman/podman.sock" "$@"
+  '';
+  podmanImageLoader = pkgs.writeShellScript "marimohub-load-podman-image" ''
+    set -eu
+    runtime_dir="/run/user/$(${pkgs.coreutils}/bin/id -u)"
+    socket="$runtime_dir/podman/podman.sock"
+    attempt=0
+    while [ ! -S "$socket" ]; do
+      attempt=$((attempt + 1))
+      if [ "$attempt" -ge 60 ]; then
+        echo "Timed out waiting for rootless Podman socket $socket" >&2
+        exit 1
+      fi
+      ${pkgs.coreutils}/bin/sleep 1
+    done
+    podman_remote() {
+      ${lib.getExe cfg.podman.package} --remote --url "unix://$socket" "$@"
+    }
+    podman_remote load --input ${lib.escapeShellArg (toString cfg.podman.image)}
+    podman_remote image exists ${lib.escapeShellArg cfg.podman.imageReference}
+  '';
 in
 {
   options.services.marimohub = {
@@ -81,12 +111,46 @@ in
     runtimePackages = lib.mkOption {
       type = lib.types.listOf lib.types.package;
       default = [ ];
-      example = lib.literalExpression "[ pkgs.docker ]";
+      example = lib.literalExpression "[ pkgs.uv pkgs.python3 pkgs.git ]";
       description = ''
-        Extra packages placed on the service PATH. Add pkgs.docker for Docker
-        compute, or pkgs.uv, pkgs.python3, and pkgs.git for local development
-        compute.
+        Extra packages placed on the service PATH. Add pkgs.uv, pkgs.python3,
+        and pkgs.git for local development compute. Rootless Podman compute adds
+        its Docker-compatible command automatically.
       '';
+    };
+
+    podman = {
+      enable = lib.mkEnableOption "rootless Podman notebook compute";
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = config.virtualisation.podman.package;
+        defaultText = lib.literalExpression "config.virtualisation.podman.package";
+        description = "Podman package used by the hub and image loader.";
+      };
+
+      image = lib.mkOption {
+        type = lib.types.package;
+        default = defaultSandboxImage;
+        defaultText = lib.literalExpression "pkgs.marimohub-sandbox-image";
+        description = ''
+          OCI archive loaded into the service user's rootless Podman image store.
+          The default is built entirely by Nix and includes Python, uv, marimo,
+          Git, and the writable environment expected by marimohub.
+        '';
+      };
+
+      imageReference = lib.mkOption {
+        type = lib.types.str;
+        default = defaultSandboxImage.imageReference;
+        defaultText = lib.literalExpression ''
+          "localhost/marimohub-sandbox:<python-and-marimo-version>"
+        '';
+        description = ''
+          Image name used by marimohub after loading podman.image. Override this
+          together with podman.image when supplying another archive.
+        '';
+      };
     };
 
     supplementaryGroups = lib.mkOption {
@@ -126,6 +190,13 @@ in
           );
         message = "services.marimohub.openFirewall has no effect with a loopback listenAddress";
       }
+      {
+        assertion = !cfg.podman.enable || (cfg.settings.MARIMOHUB_COMPUTE_BACKEND or null) == "docker";
+        message = ''
+          services.marimohub.podman requires MARIMOHUB_COMPUTE_BACKEND="docker";
+          this is the name of marimohub's Docker-compatible container adapter.
+        '';
+      }
     ];
 
     warnings = lib.optional ((cfg.settings.MARIMOHUB_AUTH_BACKEND or null) == "dev") ''
@@ -137,23 +208,85 @@ in
       marimohub = { };
     };
 
-    users.users = lib.mkIf (cfg.user == "marimohub") {
-      marimohub = {
-        isSystemUser = true;
-        inherit (cfg) group;
-        home = "/var/lib/marimohub";
-      };
+    users.users = lib.mkMerge [
+      (lib.mkIf (cfg.user == "marimohub") {
+        marimohub = {
+          isSystemUser = true;
+          inherit (cfg) group;
+          home = "/var/lib/marimohub";
+        };
+      })
+      (lib.mkIf cfg.podman.enable {
+        ${cfg.user} = {
+          autoSubUidGidRange = true;
+          linger = true;
+        };
+      })
+    ];
+
+    virtualisation.podman.enable = lib.mkIf cfg.podman.enable true;
+
+    services.marimohub.settings = lib.mkIf cfg.podman.enable {
+      MARIMOHUB_COMPUTE_BACKEND = lib.mkDefault "docker";
+      MARIMOHUB_COMPUTE_IMAGE = lib.mkDefault cfg.podman.imageReference;
+      MARIMOHUB_COMPUTE_DOCKER_HOST = lib.mkDefault "localhost";
+      MARIMOHUB_COMPUTE_DOCKER_BIND_HOST = lib.mkDefault "127.0.0.1";
     };
 
     networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ cfg.port ];
+
+    systemd.services.marimohub-podman-image = lib.mkIf cfg.podman.enable {
+      description = "Load the marimohub sandbox image into rootless Podman";
+      documentation = [ "https://github.com/afermg/marimohub-nix" ];
+      wants = [ "network-online.target" ];
+      after = [
+        "network-online.target"
+        "systemd-user-sessions.service"
+      ];
+
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = podmanImageLoader;
+        User = cfg.user;
+        Group = cfg.group;
+        Environment = "HOME=/var/lib/marimohub";
+        StateDirectory = "marimohub";
+        StateDirectoryMode = "0750";
+        RemainAfterExit = true;
+        Restart = "on-failure";
+        RestartSec = "2s";
+        TimeoutStartSec = "120s";
+        UMask = "0077";
+
+        CapabilityBoundingSet = "";
+        LockPersonality = true;
+        NoNewPrivileges = true;
+        PrivateDevices = true;
+        PrivateTmp = true;
+        ProtectClock = true;
+        ProtectControlGroups = true;
+        ProtectKernelLogs = true;
+        ProtectKernelModules = true;
+        ProtectKernelTunables = true;
+        ProtectSystem = "strict";
+        RestrictAddressFamilies = [ "AF_UNIX" ];
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        SystemCallArchitectures = "native";
+      };
+    };
 
     systemd.services.marimohub = {
       description = "marimohub notebook hub";
       documentation = [ "https://github.com/marimo-team/marimohub" ];
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
-      after = [ "network-online.target" ];
-      path = cfg.runtimePackages;
+      requires = lib.optional cfg.podman.enable "marimohub-podman-image.service";
+      after = [
+        "network-online.target"
+      ]
+      ++ lib.optional cfg.podman.enable "marimohub-podman-image.service";
+      path = cfg.runtimePackages ++ lib.optional cfg.podman.enable podmanAsDocker;
 
       environment = environment // {
         HOME = "/var/lib/marimohub";
@@ -187,7 +320,9 @@ in
         PrivateTmp = true;
         ProtectClock = true;
         ProtectControlGroups = true;
-        ProtectHome = true;
+        # Rootless Podman's API socket lives below /run/user. Keep home trees
+        # read-only rather than hidden when the hub must connect to that socket.
+        ProtectHome = if cfg.podman.enable then "read-only" else true;
         ProtectKernelLogs = true;
         ProtectKernelModules = true;
         ProtectKernelTunables = true;

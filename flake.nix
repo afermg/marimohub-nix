@@ -15,12 +15,37 @@
     {
       overlays.default = final: _prev: {
         marimohub = final.callPackage ./package.nix { };
+        marimohub-sandbox-image = final.callPackage ./sandbox-image.nix { };
       };
 
       packages = forAllSystems (system: {
         default = self.packages.${system}.marimohub;
         marimohub = nixpkgs.legacyPackages.${system}.callPackage ./package.nix { };
+        sandbox-image = nixpkgs.legacyPackages.${system}.callPackage ./sandbox-image.nix { };
       });
+
+      apps = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          image = self.packages.${system}.sandbox-image;
+          loader = pkgs.writeShellApplication {
+            name = "load-marimohub-sandbox-image";
+            runtimeInputs = [ pkgs.skopeo ];
+            text = ''
+              exec skopeo --insecure-policy copy \
+                oci-archive:${image} \
+                containers-storage:${image.imageReference}
+            '';
+          };
+        in
+        {
+          load-sandbox-image = {
+            type = "app";
+            program = nixpkgs.lib.getExe loader;
+          };
+        }
+      );
 
       nixosModules = {
         default = self.nixosModules.marimohub;
@@ -34,6 +59,7 @@
         in
         {
           package = self.packages.${system}.marimohub;
+          sandbox-image = self.packages.${system}.sandbox-image;
           module = pkgs.testers.runNixOSTest {
             name = "marimohub-module";
             nodes.machine = {
@@ -62,6 +88,101 @@
               machine.succeed("systemctl restart marimohub.service")
               machine.wait_for_open_port(3000)
               machine.succeed("curl --fail http://127.0.0.1:3000/api/health")
+            '';
+          };
+
+          podman = pkgs.testers.runNixOSTest {
+            name = "marimohub-podman";
+            nodes.machine = {
+              imports = [ self.nixosModules.marimohub ];
+
+              virtualisation = {
+                diskSize = 4096;
+                memorySize = 2048;
+              };
+
+              services.marimohub = {
+                enable = true;
+                package = self.packages.${system}.marimohub;
+                podman = {
+                  enable = true;
+                  image = self.packages.${system}.sandbox-image;
+                  imageReference = self.packages.${system}.sandbox-image.imageReference;
+                };
+                settings = {
+                  MARIMOHUB_STORAGE_BACKEND = "fs";
+                  MARIMOHUB_STORAGE_FS_ROOT = "/var/lib/marimohub/storage";
+                  MARIMOHUB_AUTH_BACKEND = "dev";
+                  MARIMOHUB_RUN_MAINTENANCE = true;
+                };
+              };
+            };
+
+            testScript = ''
+              import json
+              import shlex
+
+              start_all()
+              machine.wait_for_unit("marimohub-podman-image.service")
+              machine.wait_for_unit("marimohub.service")
+              machine.wait_for_open_port(3000)
+
+              uid = machine.succeed("id -u marimohub").strip()
+              socket = f"unix:///run/user/{uid}/podman/podman.sock"
+              remote = (
+                  "runuser -u marimohub -- env HOME=/var/lib/marimohub "
+                  f"podman --remote --url {socket}"
+              )
+              image = ${builtins.toJSON self.packages.${system}.sandbox-image.imageReference}
+
+              machine.succeed(f"{remote} image exists {shlex.quote(image)}")
+              machine.succeed(f"{remote} info --format '{{{{.Host.Security.Rootless}}}}' | grep true")
+
+              projects = json.loads(
+                  machine.succeed("curl --fail --silent http://127.0.0.1:3000/api/v1/projects")
+              )
+              pid = projects["data"]["items"][0]["id"]
+              notebook_body = json.dumps({
+                  "title": "Rootless Podman test",
+                  "description": "NixOS integration test",
+                  "code": "import marimo as mo\\napp = mo.App()\\nif __name__ == '__main__':\\n    app.run()\\n",
+              })
+              notebook = json.loads(machine.succeed(
+                  "curl --fail-with-body --silent -X POST "
+                  f"http://127.0.0.1:3000/api/v1/projects/{pid}/notebooks "
+                  "-H 'Content-Type: application/json' --data " + shlex.quote(notebook_body)
+              ))
+              nid = notebook["data"]["id"]
+
+              session = json.loads(machine.succeed(
+                  "curl --fail-with-body --silent -X POST "
+                  f"http://127.0.0.1:3000/api/v1/projects/{pid}/notebooks/{nid}/sessions"
+              ))["data"]
+              assert session["status"] == "running", session
+              assert session["sandbox_url"].startswith("http://localhost:"), session
+
+              container = machine.succeed(
+                  f"{remote} ps --filter label=marimohub.sandbox --format '{{{{.Names}}}}'"
+              ).strip()
+              assert container.startswith("marimohub-sbx-"), container
+              machine.succeed(
+                  f"{remote} exec {shlex.quote(container)} sh -c "
+                  + shlex.quote('test "$(id -u)" = 1000')
+              )
+              machine.succeed(
+                  "curl --fail --silent --retry 20 --retry-connrefused "
+                  + shlex.quote(session["sandbox_url"])
+                  + " | grep -i marimo"
+              )
+
+              machine.succeed(
+                  "curl --fail-with-body --silent -X DELETE "
+                  f"http://127.0.0.1:3000/api/v1/projects/{pid}/notebooks/{nid}/sessions/"
+                  + session["session_id"]
+              )
+              machine.wait_until_succeeds(
+                  f"test -z \"$({remote} ps --filter label=marimohub.sandbox --format '{{{{.Names}}}}')\""
+              )
             '';
           };
         }

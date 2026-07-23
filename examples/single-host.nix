@@ -1,10 +1,7 @@
-# Import this flake's NixOS module and adapt the domain, OIDC values, and image.
-# This example keeps notebooks on local disk and kernels in Docker containers.
-{
-  config,
-  pkgs,
-  ...
-}:
+# Import this flake's NixOS module and adapt the domain and OIDC values. This
+# example keeps notebooks on local disk and kernels in rootless Podman containers
+# built reproducibly as a Nix OCI image.
+{ config, ... }:
 
 {
   services.marimohub = {
@@ -12,14 +9,14 @@
     listenAddress = "127.0.0.1";
     port = 3000;
 
+    # Enables a lingering rootless Podman service for the marimohub account,
+    # loads the flake's Nix-built sandbox image, and supplies the Docker-compatible
+    # command expected by upstream's `docker` compute adapter.
+    podman.enable = true;
+
     settings = {
       MARIMOHUB_STORAGE_BACKEND = "fs";
       MARIMOHUB_STORAGE_FS_ROOT = "/var/lib/marimohub/storage";
-
-      MARIMOHUB_COMPUTE_BACKEND = "docker";
-      MARIMOHUB_COMPUTE_IMAGE = "ghcr.io/your-org/marimo-sandbox:latest";
-      MARIMOHUB_COMPUTE_DOCKER_HOST = "localhost";
-      MARIMOHUB_COMPUTE_DOCKER_BIND_HOST = "127.0.0.1";
 
       # The hub proxies private loopback kernel ports. Use this only for trusted
       # users: notebook code is served on the control plane's origin.
@@ -39,11 +36,9 @@
 
     # Root-owned, mode 0400; see examples/marimohub.env.example.
     environmentFiles = [ "/run/keys/marimohub.env" ];
-    runtimePackages = [ pkgs.docker ];
-    supplementaryGroups = [ "docker" ];
   };
 
-  virtualisation.docker.enable = true;
+  virtualisation.podman.autoPrune.enable = true;
 
   services.caddy = {
     enable = true;
