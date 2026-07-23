@@ -91,6 +91,106 @@
             '';
           };
 
+          dex = pkgs.testers.runNixOSTest {
+            name = "marimohub-dex";
+            nodes.machine = {
+              imports = [ self.nixosModules.marimohub ];
+
+              environment.etc."marimohub-dex.env".text = ''
+                MARIMOHUB_AUTH_OIDC_CLIENT_SECRET=dex-test-client-secret-0123456789
+                MARIMOHUB_AUTH_SESSION_SECRET=session-test-secret-0123456789-abcdefghijklmnopqrstuvwxyz
+                DEX_ALICE_PASSWORD_HASH=$2a$10$9S6cLl7S29wRzQoCLWideeF5uaS8siq6SiNC2Lxrz4bk0pIEzouz.
+                DEX_BOB_PASSWORD_HASH=$2a$10$9S6cLl7S29wRzQoCLWideeF5uaS8siq6SiNC2Lxrz4bk0pIEzouz.
+              '';
+
+              services.marimohub = {
+                enable = true;
+                package = self.packages.${system}.marimohub;
+                dex = {
+                  enable = true;
+                  environmentFile = "/etc/marimohub-dex.env";
+                  users = [
+                    {
+                      email = "alice@example.test";
+                      username = "alice";
+                      userId = "alice";
+                      passwordHashEnv = "DEX_ALICE_PASSWORD_HASH";
+                    }
+                    {
+                      email = "bob@example.test";
+                      username = "bob";
+                      userId = "bob";
+                      passwordHashEnv = "DEX_BOB_PASSWORD_HASH";
+                    }
+                  ];
+                };
+                settings = {
+                  MARIMOHUB_STORAGE_BACKEND = "fs";
+                  MARIMOHUB_STORAGE_FS_ROOT = "/var/lib/marimohub/storage";
+                  MARIMOHUB_COMPUTE_BACKEND = "none";
+                  MARIMOHUB_RUN_MAINTENANCE = true;
+                };
+              };
+            };
+
+            testScript = ''
+              import json
+              import shlex
+
+              start_all()
+              machine.wait_for_unit("dex.service")
+              machine.wait_for_unit("marimohub.service")
+              machine.wait_for_open_port(5556)
+              machine.wait_for_open_port(3000)
+              machine.succeed(
+                  "curl --fail --silent "
+                  "http://localhost:5556/dex/.well-known/openid-configuration"
+              )
+
+              def redirect(command):
+                  url = machine.succeed(command + " -o /dev/null -w '%{redirect_url}'").strip()
+                  assert url.startswith("http://localhost:"), url
+                  return url
+
+              def login(email, cookie_jar):
+                  jar = shlex.quote(cookie_jar)
+                  common = f"curl --silent --show-error -b {jar} -c {jar}"
+                  login_url = redirect(
+                      f"{common} http://localhost:3000/api/auth/login"
+                  )
+                  connector_url = redirect(f"{common} {shlex.quote(login_url)}")
+                  form_url = redirect(f"{common} {shlex.quote(connector_url)}")
+                  machine.succeed(
+                      f"{common} {shlex.quote(form_url)} | grep -q 'name=\"password\"'"
+                  )
+                  callback_url = redirect(
+                      f"{common} --data-urlencode login={shlex.quote(email)} "
+                      "--data-urlencode password=correct-horse-battery-staple "
+                      f"{shlex.quote(form_url)}"
+                  )
+                  machine.succeed(f"{common} {shlex.quote(callback_url)} -o /dev/null")
+                  return json.loads(machine.succeed(
+                      f"{common} http://localhost:3000/api/v1/me"
+                  ))["data"]
+
+              alice = login("alice@example.test", "/tmp/alice.cookies")
+              bob = login("bob@example.test", "/tmp/bob.cookies")
+              assert alice["email"] == "alice@example.test", alice
+              assert bob["email"] == "bob@example.test", bob
+              assert alice["id"] != bob["id"], (alice, bob)
+              assert alice["logout_url"] == "/api/auth/logout", alice
+
+              machine.succeed(
+                  "curl --silent -b /tmp/alice.cookies -c /tmp/alice.cookies "
+                  "http://localhost:3000/api/auth/logout -o /dev/null"
+              )
+              machine.succeed(
+                  "test \"$(curl --silent -b /tmp/alice.cookies -o /dev/null -w '%{http_code}' "
+                  "http://localhost:3000/api/v1/me)\" = 401"
+              )
+            '';
+          };
+
           podman = pkgs.testers.runNixOSTest {
             name = "marimohub-podman";
             nodes.machine = {

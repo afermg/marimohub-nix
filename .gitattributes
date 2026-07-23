@@ -1,0 +1,2 @@
+# Patch context lines intentionally begin with a diff marker followed by source indentation.
+*.patch -whitespace

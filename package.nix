@@ -43,6 +43,8 @@ stdenvNoCC.mkDerivation (finalAttrs: {
 
   env.CI = "true";
 
+  patches = [ ./patches/local-oidc-http.patch ];
+
   postPatch = ''
     # Upstream currently listens on every interface. Add a downstream knob so the
     # NixOS module can default to loopback when a reverse proxy is used.

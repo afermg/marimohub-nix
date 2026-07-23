@@ -1,6 +1,6 @@
-# Import this flake's NixOS module and adapt the domain and OIDC values. This
-# example keeps notebooks on local disk and kernels in rootless Podman containers
-# built reproducibly as a Nix OCI image.
+# Import this flake's NixOS module and adapt the domains and users. This example
+# keeps notebooks on local disk, authenticates static users through Dex, and runs
+# kernels in rootless Podman containers built reproducibly as a Nix OCI image.
 { config, ... }:
 
 {
@@ -14,6 +14,23 @@
     # command expected by upstream's `docker` compute adapter.
     podman.enable = true;
 
+    dex = {
+      enable = true;
+      issuer = "https://auth.example.com/dex";
+      redirectUri = "https://hub.example.com/api/auth/callback";
+      allowInsecureHttp = false;
+      environmentFile = "/run/keys/marimohub.env";
+      allowedEmailDomains = [ "example.com" ];
+      users = [
+        {
+          email = "alice@example.com";
+          username = "alice";
+          userId = "alice";
+          passwordHashEnv = "DEX_ALICE_PASSWORD_HASH";
+        }
+      ];
+    };
+
     settings = {
       MARIMOHUB_STORAGE_BACKEND = "fs";
       MARIMOHUB_STORAGE_FS_ROOT = "/var/lib/marimohub/storage";
@@ -24,27 +41,22 @@
       MARIMOHUB_SANDBOX_PROXY_ACK_UNTRUSTED = true;
       MARIMOHUB_APP_BASE_URL = "https://hub.example.com";
 
-      MARIMOHUB_AUTH_BACKEND = "oidc";
-      MARIMOHUB_AUTH_OIDC_ISSUER = "https://accounts.example.com";
-      MARIMOHUB_AUTH_OIDC_CLIENT_ID = "marimohub";
-      MARIMOHUB_AUTH_OIDC_REDIRECT_URI = "https://hub.example.com/api/auth/callback";
-      MARIMOHUB_AUTH_ALLOWED_EMAIL_DOMAINS = "example.com";
-      MARIMOHUB_DEFAULT_ROLE = "none";
-
       MARIMOHUB_RUN_MAINTENANCE = true;
     };
-
-    # Root-owned, mode 0400; see examples/marimohub.env.example.
-    environmentFiles = [ "/run/keys/marimohub.env" ];
   };
 
   virtualisation.podman.autoPrune.enable = true;
 
   services.caddy = {
     enable = true;
-    virtualHosts."hub.example.com".extraConfig = ''
-      reverse_proxy 127.0.0.1:${toString config.services.marimohub.port}
-    '';
+    virtualHosts = {
+      "hub.example.com".extraConfig = ''
+        reverse_proxy 127.0.0.1:${toString config.services.marimohub.port}
+      '';
+      "auth.example.com".extraConfig = ''
+        reverse_proxy 127.0.0.1:${toString config.services.marimohub.dex.port}
+      '';
+    };
   };
 
   networking.firewall.allowedTCPPorts = [
