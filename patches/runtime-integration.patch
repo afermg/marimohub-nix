@@ -1,0 +1,386 @@
+diff --git a/packages/auth-oidc/src/index.test.ts b/packages/auth-oidc/src/index.test.ts
+index 986f22c..51a81fa 100644
+--- a/packages/auth-oidc/src/index.test.ts
++++ b/packages/auth-oidc/src/index.test.ts
+@@ -1,6 +1,11 @@
+ import { beforeEach, describe, it, expect, vi } from 'vitest';
+ import { SignJWT } from 'jose';
+-import { createOidcAuth, normalizeEmailDomains, emailDomainAllowed } from './index';
++import {
++	createOidcAuth,
++	normalizeAllowedEmails,
++	normalizeEmailDomains,
++	emailDomainAllowed,
++} from './index';
+ 
+ const oauthMock = vi.hoisted(() => ({
+ 	ClientSecretPost: vi.fn(),
+@@ -162,6 +167,15 @@ describe('normalizeEmailDomains', () => {
+ 	});
+ });
+ 
++describe('normalizeAllowedEmails', () => {
++	it('normalizes exact addresses case-insensitively', () => {
++		expect(normalizeAllowedEmails([' Alice@Example.COM ', '', 'bob@gmail.com'])).toEqual([
++			'alice@example.com',
++			'bob@gmail.com',
++		]);
++	});
++});
++
+ describe('emailDomainAllowed', () => {
+ 	const allowed = ['example.com'];
+ 
+@@ -274,6 +288,7 @@ describe('OIDC routes', () => {
+ 			expect.any(URLSearchParams),
+ 			BASE_CONFIG.redirectUri,
+ 			'verifier-1',
++			{},
+ 		);
+ 		const sessionCookie = cookiePair(res, SESSION_COOKIE);
+ 		await expect(
+@@ -340,6 +355,37 @@ describe('OIDC routes', () => {
+ 		expect(res.headers.get('set-cookie') ?? '').toMatch(/mh_session=[^;,]+/);
+ 	});
+ 
++	it('accepts an exact allowed email case-insensitively', async () => {
++		oauthMock.getValidatedIdTokenClaims.mockReturnValue({
++			sub: 'user-1',
++			email: 'User@Example.com',
++			email_verified: true,
++		});
++		const { routes } = makeOidc({ allowedEmails: ['user@example.COM'] });
++		const txn = await beginOidcTransaction(routes);
++
++		const res = await routes.request('/api/auth/callback?code=abc&state=state-1', {
++			headers: { cookie: txn },
++		});
++
++		expect(res.status).toBe(302);
++		expect(res.headers.get('location')).toBe('/');
++		expect(res.headers.get('set-cookie') ?? '').toMatch(/mh_session=[^;,]+/);
++	});
++
++	it('rejects an email outside the exact allowlist', async () => {
++		const { routes } = makeOidc({ allowedEmails: ['invited@example.com'] });
++		const txn = await beginOidcTransaction(routes);
++
++		const res = await routes.request('/api/auth/callback?code=abc&state=state-1', {
++			headers: { cookie: txn },
++		});
++
++		expect(res.status).toBe(302);
++		expect(res.headers.get('location')).toBe('/?auth_error=email_not_allowed');
++		expect(res.headers.get('set-cookie') ?? '').not.toMatch(/mh_session=[^;,]+/);
++	});
++
+ 	it('rejects a restricted-domain callback when the email domain is not allowed', async () => {
+ 		oauthMock.getValidatedIdTokenClaims.mockReturnValue({
+ 			sub: 'user-1',
+diff --git a/packages/auth-oidc/src/index.ts b/packages/auth-oidc/src/index.ts
+index bbb6194..dcf3b3e 100644
+--- a/packages/auth-oidc/src/index.ts
++++ b/packages/auth-oidc/src/index.ts
+@@ -30,6 +30,8 @@ export interface OidcConfig {
+ 	clientSecret: string;
+ 	/** Absolute callback URL, e.g. `https://hub.example.com/api/auth/callback`. */
+ 	redirectUri: string;
++	/** Permit HTTP only for loopback issuers/callbacks. Local development only. */
++	allowInsecureHttp?: boolean;
+ 	/**
+ 	 * Expected ID-token audience. Deprecated/unused: per the OIDC spec the ID
+ 	 * token's `aud` must contain `clientId`, which oauth4webapi enforces
+@@ -55,11 +57,17 @@ export interface OidcConfig {
+ 	 * means any successfully-authenticated account is accepted.
+ 	 */
+ 	allowedEmailDomains?: string[];
++	/** Exact verified email addresses allowed to sign in. Empty/undefined means unrestricted. */
++	allowedEmails?: string[];
+ }
+ 
+ const SESSION_COOKIE = 'mh_session';
+ const TXN_COOKIE = 'mh_oidc_txn';
+ 
++function isLoopback(url: URL): boolean {
++	return ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
++}
++
+ /**
+  * Normalize an email-domain allowlist: lowercase, trimmed, leading-`@` stripped,
+  * blanks dropped. Exported for direct unit testing of the (otherwise network-gated)
+@@ -76,6 +84,11 @@ export function emailDomainAllowed(email: string, allowedDomains: readonly strin
+ 	return allowedDomains.includes(email.slice(at + 1).toLowerCase());
+ }
+ 
++/** Normalize an exact-address allowlist for case-insensitive email matching. */
++export function normalizeAllowedEmails(emails: readonly string[] | undefined): string[] {
++	return (emails ?? []).map((email) => email.trim().toLowerCase()).filter(Boolean);
++}
++
+ export function createOidcAuth(config: OidcConfig): { authenticator: Authenticator; routes: Hono } {
+ 	const secretBytes = new TextEncoder().encode(config.sessionSecret);
+ 	if (secretBytes.length < 32) {
+@@ -90,9 +103,26 @@ export function createOidcAuth(config: OidcConfig): { authenticator: Authenticat
+ 	const sessionTtl = config.sessionTtlSeconds ?? 8 * 60 * 60;
+ 	// Normalize the email-domain allowlist once. Empty means "no restriction".
+ 	const allowedDomains = normalizeEmailDomains(config.allowedEmailDomains);
++	const allowedEmails = normalizeAllowedEmails(config.allowedEmails);
+ 	const restrictDomains = allowedDomains.length > 0;
++	const restrictEmails = allowedEmails.length > 0;
+ 
+ 	const issuerUrl = new URL(config.issuer);
++	const redirectUrl = new URL(config.redirectUri);
++	const allowInsecureHttp = config.allowInsecureHttp ?? false;
++	for (const url of [issuerUrl, redirectUrl]) {
++		if (!['https:', 'http:'].includes(url.protocol)) {
++			throw new Error(`OIDC URL must use HTTP or HTTPS: ${url.href}`);
++		}
++		if (url.protocol === 'http:' && (!allowInsecureHttp || !isLoopback(url))) {
++			throw new Error(
++				'MARIMOHUB_AUTH_OIDC_ALLOW_INSECURE_HTTP permits HTTP only for loopback ' +
++					`OIDC URLs; refusing ${url.href}`,
++			);
++		}
++	}
++	const secureCookies = redirectUrl.protocol === 'https:';
++	const requestOptions = allowInsecureHttp ? { [oauth.allowInsecureRequests]: true } : {};
+ 	const client: oauth.Client = { client_id: config.clientId };
+ 	const clientAuth = oauth.ClientSecretPost(config.clientSecret);
+ 
+@@ -101,7 +131,7 @@ export function createOidcAuth(config: OidcConfig): { authenticator: Authenticat
+ 	function authServer(): Promise<oauth.AuthorizationServer> {
+ 		if (!asPromise) {
+ 			asPromise = oauth
+-				.discoveryRequest(issuerUrl, { algorithm: 'oidc' })
++				.discoveryRequest(issuerUrl, { algorithm: 'oidc', ...requestOptions })
+ 				.then((res) => oauth.processDiscoveryResponse(issuerUrl, res));
+ 		}
+ 		return asPromise;
+@@ -175,7 +205,7 @@ export function createOidcAuth(config: OidcConfig): { authenticator: Authenticat
+ 			.sign(secret);
+ 		setCookie(c, TXN_COOKIE, txn, {
+ 			httpOnly: true,
+-			secure: true,
++			secure: secureCookies,
+ 			sameSite: 'Lax',
+ 			path: '/',
+ 			maxAge: 600,
+@@ -238,6 +268,7 @@ export function createOidcAuth(config: OidcConfig): { authenticator: Authenticat
+ 				params,
+ 				config.redirectUri,
+ 				verifier,
++				requestOptions,
+ 			);
+ 			const result = await oauth.processAuthorizationCodeResponse(as, client, response, {
+ 				expectedNonce,
+@@ -262,13 +293,16 @@ export function createOidcAuth(config: OidcConfig): { authenticator: Authenticat
+ 			return callbackError(c, 'email_not_verified');
+ 		}
+ 
+-		if (restrictDomains) {
+-			// Require a provider-verified address before trusting its domain — an
+-			// unverified email could carry an attacker-chosen `@marimo.io` value.
++		if (restrictDomains || restrictEmails) {
++			// Require a provider-verified address before trusting either restriction —
++			// an unverified email is attacker-controlled on many providers.
+ 			if (claims.email_verified !== true) {
+ 				return callbackError(c, 'email_not_verified');
+ 			}
+-			if (!emailDomainAllowed(claims.email, allowedDomains)) {
++			if (restrictEmails && !allowedEmails.includes(claims.email.toLowerCase())) {
++				return callbackError(c, 'email_not_allowed');
++			}
++			if (restrictDomains && !emailDomainAllowed(claims.email, allowedDomains)) {
+ 				return callbackError(c, 'domain_not_allowed');
+ 			}
+ 		}
+@@ -279,7 +313,7 @@ export function createOidcAuth(config: OidcConfig): { authenticator: Authenticat
+ 		const session = await signSession({ id: UserId.parse(claims.sub), email: claims.email, name });
+ 		setCookie(c, SESSION_COOKIE, session, {
+ 			httpOnly: true,
+-			secure: true,
++			secure: secureCookies,
+ 			sameSite: 'Lax',
+ 			path: '/',
+ 			maxAge: sessionTtl,
+diff --git a/packages/compute-docker/src/index.test.ts b/packages/compute-docker/src/index.test.ts
+index f43ca69..7ac5646 100644
+--- a/packages/compute-docker/src/index.test.ts
++++ b/packages/compute-docker/src/index.test.ts
+@@ -65,6 +65,25 @@ describe('DockerCompute', () => {
+ 		expect(execCall).toBeDefined();
+ 	});
+ 
++	it('passes configured host and CDI devices to docker run', async () => {
++		const { runner, calls } = fakeRunner(defaultHandler);
++		const compute = new DockerCompute(
++			{ image: 'my-image', devices: ['/dev/zero:/dev/test-device', 'nvidia.com/gpu=all'] },
++			runner,
++		);
++		await compute.create(SANDBOX_ID).exec('true');
++
++		const runArgs = calls.find((c) => c.args[0] === 'run')!.args;
++		expect(runArgs).toEqual(
++			expect.arrayContaining([
++				'--device',
++				'/dev/zero:/dev/test-device',
++				'--device',
++				'nvidia.com/gpu=all',
++			]),
++		);
++	});
++
+ 	it('a per-create image override replaces the configured image in docker run', async () => {
+ 		const { runner, calls } = fakeRunner(defaultHandler);
+ 		const compute = new DockerCompute({ image: 'my-image' }, runner);
+diff --git a/packages/compute-docker/src/index.ts b/packages/compute-docker/src/index.ts
+index 3b6f476..9859b49 100644
+--- a/packages/compute-docker/src/index.ts
++++ b/packages/compute-docker/src/index.ts
+@@ -108,6 +108,8 @@ export interface DockerConfig {
+ 	bindHost?: string;
+ 	/** Optional docker network to attach sandboxes to. */
+ 	network?: string;
++	/** Devices passed to `docker run --device` (host paths or CDI names). */
++	devices?: string[];
+ 	/** Label key used to tag + enumerate our containers. Default `marimohub.sandbox`. */
+ 	labelKey?: string;
+ }
+@@ -152,6 +154,7 @@ class DockerSandboxInstance implements SandboxInstance {
+ 			`${this.config.bindHost}::${KERNEL_PORT}`,
+ 		];
+ 		if (this.config.network) args.push('--network', this.config.network);
++		for (const device of this.config.devices) args.push('--device', device);
+ 		args.push(this.config.image, 'sleep', 'infinity');
+ 
+ 		const res = await this.docker.run(args);
+@@ -330,6 +333,7 @@ export class DockerCompute implements SandboxProvider {
+ 			bindHost: config.bindHost || '127.0.0.1',
+ 			labelKey: config.labelKey || DEFAULT_LABEL_KEY,
+ 			network: config.network,
++			devices: config.devices ?? [],
+ 		};
+ 	}
+ 
+diff --git a/packages/config/src/auth.ts b/packages/config/src/auth.ts
+index ae3696a..6db567f 100644
+--- a/packages/config/src/auth.ts
++++ b/packages/config/src/auth.ts
+@@ -2,7 +2,7 @@ import type { Authenticator } from '@marimo-hub/core';
+ import { createOidcAuth } from '@marimo-hub/auth-oidc';
+ import { DevAuthenticator } from '@marimo-hub/auth-dev';
+ import type { Hono } from 'hono';
+-import { parseList, requiredVar } from './env';
++import { parseBool, parseList, requiredVar } from './env';
+ import type { Env } from './env';
+ import { ConfigError } from './errors';
+ 
+@@ -15,8 +15,12 @@ import { ConfigError } from './errors';
+  * `*` to opt into allowing all domains (a conscious choice, like the
+  * `MARIMOHUB_ALLOW_EPHEMERAL_STORAGE` gate).
+  */
+-function parseEmailDomains(raw: string | undefined): string[] | undefined {
++function parseEmailDomains(
++	raw: string | undefined,
++	hasExactEmailAllowlist: boolean,
++): string[] | undefined {
+ 	const value = raw?.trim();
++	if (!value && hasExactEmailAllowlist) return undefined;
+ 	if (!value) {
+ 		throw new ConfigError(
+ 			'MARIMOHUB_AUTH_ALLOWED_EMAIL_DOMAINS must be set for the oidc backend, so an internal ' +
+@@ -62,14 +66,21 @@ export function makeAuth(env: Env): { authenticator: Authenticator; authRoutes?:
+ 		});
+ 	switch (backend) {
+ 		case 'oidc': {
++			const allowedEmails = parseList(env.MARIMOHUB_AUTH_ALLOWED_EMAILS);
+ 			const { authenticator, routes } = createOidcAuth({
+ 				issuer: oidc('MARIMOHUB_AUTH_OIDC_ISSUER'),
+ 				clientId: oidc('MARIMOHUB_AUTH_OIDC_CLIENT_ID'),
+ 				clientSecret: oidc('MARIMOHUB_AUTH_OIDC_CLIENT_SECRET'),
+ 				redirectUri: oidc('MARIMOHUB_AUTH_OIDC_REDIRECT_URI'),
+ 				audience: env.MARIMOHUB_AUTH_OIDC_AUDIENCE,
++				scopes: env.MARIMOHUB_AUTH_OIDC_SCOPES,
++				allowInsecureHttp: parseBool(env, 'MARIMOHUB_AUTH_OIDC_ALLOW_INSECURE_HTTP'),
+ 				sessionSecret: oidc('MARIMOHUB_AUTH_SESSION_SECRET'),
+-				allowedEmailDomains: parseEmailDomains(env.MARIMOHUB_AUTH_ALLOWED_EMAIL_DOMAINS),
++				allowedEmailDomains: parseEmailDomains(
++					env.MARIMOHUB_AUTH_ALLOWED_EMAIL_DOMAINS,
++					allowedEmails !== undefined,
++				),
++				allowedEmails,
+ 			});
+ 			return { authenticator, authRoutes: routes };
+ 		}
+diff --git a/packages/config/src/compute.ts b/packages/config/src/compute.ts
+index 2c7b0ec..ea0f342 100644
+--- a/packages/config/src/compute.ts
++++ b/packages/config/src/compute.ts
+@@ -219,6 +219,7 @@ export function makeCompute(env: Env, opts?: ComputeOptions): SandboxProvider {
+ 				host: env.MARIMOHUB_COMPUTE_DOCKER_HOST,
+ 				bindHost: env.MARIMOHUB_COMPUTE_DOCKER_BIND_HOST,
+ 				network: env.MARIMOHUB_COMPUTE_DOCKER_NETWORK,
++				devices: parseList(env.MARIMOHUB_COMPUTE_DOCKER_DEVICES),
+ 			});
+ 		case 'e2b':
+ 			// E2B sandboxes (e2b.dev): per-session sandbox with a public per-port URL
+diff --git a/packages/config/src/spec.ts b/packages/config/src/spec.ts
+index af8ed90..c9ba0df 100644
+--- a/packages/config/src/spec.ts
++++ b/packages/config/src/spec.ts
+@@ -408,6 +408,13 @@ export const CONFIG_SPEC: ConfigGroup[] = [
+ 						description: 'Optional Docker network to attach sandboxes to.',
+ 						example: 'marimohub',
+ 					},
++					{
++						id: 'MARIMOHUB_COMPUTE_DOCKER_DEVICES',
++						name: 'Docker devices',
++						description:
++							'Comma-separated devices passed to `docker run --device`, including CDI names such as `nvidia.com/gpu=all`.',
++						example: 'nvidia.com/gpu=all',
++					},
+ 				],
+ 			},
+ 			{
+@@ -642,6 +649,19 @@ export const CONFIG_SPEC: ConfigGroup[] = [
+ 						description:
+ 							'Expected ID-token audience (optional; oauth4webapi enforces the client id automatically).',
+ 					},
++					{
++						id: 'MARIMOHUB_AUTH_OIDC_SCOPES',
++						name: 'OIDC scopes',
++						description: 'Space-separated OIDC scopes. Defaults to `openid email profile`.',
++						example: 'openid email',
++					},
++					{
++						id: 'MARIMOHUB_AUTH_OIDC_ALLOW_INSECURE_HTTP',
++						name: 'Allow loopback HTTP OIDC',
++						description:
++							'Allow an HTTP issuer and callback only on loopback hosts. Local development only.',
++						default: false,
++					},
+ 					{
+ 						id: 'MARIMOHUB_AUTH_SESSION_SECRET',
+ 						name: 'Session secret',
+@@ -649,13 +669,19 @@ export const CONFIG_SPEC: ConfigGroup[] = [
+ 						required: true,
+ 						secret: true,
+ 					},
++					{
++						id: 'MARIMOHUB_AUTH_ALLOWED_EMAILS',
++						name: 'Allowed emails',
++						description:
++							'Optional comma-separated exact verified-email allowlist. Configure this or allowed domains.',
++						example: 'alice@example.com,bob@gmail.com',
++					},
+ 					{
+ 						id: 'MARIMOHUB_AUTH_ALLOWED_EMAIL_DOMAINS',
+ 						name: 'Allowed email domains',
+ 						description:
+-							'Comma-separated email-domain allowlist (requires a verified email). Required so a deployment cannot silently admit every account the IdP authenticates; set `*` to explicitly allow all domains. A single domain is also sent to Google as the `hd` hint.',
++							'Optional comma-separated verified-email domain allowlist. Configure this or exact allowed emails; set `*` to deliberately admit every identity-provider account. A single domain is also sent to Google as the `hd` hint.',
+ 						example: 'example.com,example.org',
+-						required: true,
+ 					},
+ 				],
+ 			},

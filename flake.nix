@@ -18,11 +18,50 @@
         marimohub-sandbox-image = final.callPackage ./sandbox-image.nix { };
       };
 
-      packages = forAllSystems (system: {
-        default = self.packages.${system}.marimohub;
-        marimohub = nixpkgs.legacyPackages.${system}.callPackage ./package.nix { };
-        sandbox-image = nixpkgs.legacyPackages.${system}.callPackage ./sandbox-image.nix { };
-      });
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          image = self.packages.${system}.sandbox-image;
+          gpuSmokeTest = pkgs.writeShellApplication {
+            name = "test-marimohub-gpu-rapids";
+            runtimeInputs = [
+              pkgs.podman
+              pkgs.skopeo
+            ];
+            text = ''
+              skopeo --insecure-policy copy \
+                oci-archive:${image} \
+                containers-storage:${image.imageReference}
+              exec podman run --rm \
+                --device "''${MARIMOHUB_GPU_DEVICE:-nvidia.com/gpu=all}" \
+                ${image.imageReference} sh -lc '
+                  set -eu
+                  install-rapids-singlecell
+                  python - <<"PY"
+              import cupy as cp
+              from anndata import AnnData
+              import rapids_singlecell as rsc
+
+              assert cp.cuda.runtime.getDeviceCount() > 0
+              adata = AnnData(cp.array([[1, 0], [3, 0], [5, 6]], dtype=cp.float32))
+              rsc.pp.normalize_total(adata, target_sum=1)
+              cp.testing.assert_allclose(adata.X.sum(axis=1), cp.ones(3, dtype=cp.float32))
+              print("rapids-singlecell", rsc.__version__)
+              print("GPU", cp.cuda.runtime.getDeviceProperties(0)["name"].decode())
+              print("GPU normalization: OK")
+              PY
+                '
+            '';
+          };
+        in
+        {
+          default = self.packages.${system}.marimohub;
+          marimohub = pkgs.callPackage ./package.nix { };
+          sandbox-image = pkgs.callPackage ./sandbox-image.nix { };
+          gpu-smoke-test = gpuSmokeTest;
+        }
+      );
 
       apps = forAllSystems (
         system:
@@ -38,11 +77,16 @@
                 containers-storage:${image.imageReference}
             '';
           };
+          gpuSmokeTest = self.packages.${system}.gpu-smoke-test;
         in
         {
           load-sandbox-image = {
             type = "app";
             program = nixpkgs.lib.getExe loader;
+          };
+          test-gpu-rapids = {
+            type = "app";
+            program = nixpkgs.lib.getExe gpuSmokeTest;
           };
         }
       );
@@ -60,6 +104,7 @@
         {
           package = self.packages.${system}.marimohub;
           sandbox-image = self.packages.${system}.sandbox-image;
+          gpu-smoke-test = self.packages.${system}.gpu-smoke-test;
           module = pkgs.testers.runNixOSTest {
             name = "marimohub-module";
             nodes.machine = {
@@ -208,6 +253,9 @@
                   enable = true;
                   image = self.packages.${system}.sandbox-image;
                   imageReference = self.packages.${system}.sandbox-image.imageReference;
+                  # Exercise the downstream generic --device wiring without
+                  # requiring GPU hardware in the VM test.
+                  devices = [ "/dev/zero:/dev/marimohub-test-device" ];
                 };
                 settings = {
                   MARIMOHUB_STORAGE_BACKEND = "fs";
@@ -268,6 +316,13 @@
               machine.succeed(
                   f"{remote} exec {shlex.quote(container)} sh -c "
                   + shlex.quote('test "$(id -u)" = 1000')
+              )
+              machine.succeed(
+                  f"{remote} exec {shlex.quote(container)} sh -lc "
+                  + shlex.quote(
+                      "test -c /dev/marimohub-test-device && "
+                      "python -c \"import ctypes; ctypes.CDLL('libstdc++.so.6'); ctypes.CDLL('libz.so.1')\""
+                  )
               )
               machine.succeed(
                   "curl --fail --silent --retry 20 --retry-connrefused "

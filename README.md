@@ -9,6 +9,7 @@ storing, managing, and running marimo notebooks.
 - `packages.<system>.marimohub`: self-contained Node server and web UI
 - `packages.<system>.sandbox-image`: Nix-built OCI kernel image
 - `apps.<system>.load-sandbox-image`: load that image into the current user's Podman store
+- `apps.<system>.test-gpu-rapids`: install and run a real RAPIDS single-cell GPU smoke test
 - `nixosModules.marimohub`: `services.marimohub` NixOS module
 - `overlays.default`: `pkgs.marimohub` and `pkgs.marimohub-sandbox-image`
 - NixOS VM tests for the service, two-user Dex login, and a real rootless Podman kernel session
@@ -58,9 +59,50 @@ $ curl http://127.0.0.1:3000/api/health
 {"status":"ok"}
 ```
 
+## Direct Google authentication
+
+Google can be used as marimohub's OIDC provider without Dex. Create an External
+OAuth web client in Google Cloud and register the exact callback
+`https://hub.example.com/api/auth/callback`. The client requests only `openid
+email`; Google passwords, MFA, and recovery never touch this host.
+
+```nix
+services.marimohub = {
+  enable = true;
+  google = {
+    enable = true;
+    clientId = "replace-me.apps.googleusercontent.com";
+    redirectUri = "https://hub.example.com/api/auth/callback";
+    environmentFile = "/run/keys/marimohub-google.env";
+    # Exact allowlist supports Gmail and other unrelated account domains.
+    allowedEmails = [ "alice@example.com" "bob@gmail.com" ];
+  };
+  settings = {
+    MARIMOHUB_STORAGE_BACKEND = "fs";
+    MARIMOHUB_STORAGE_FS_ROOT = "/var/lib/marimohub/storage";
+    MARIMOHUB_COMPUTE_BACKEND = "none";
+    MARIMOHUB_RUN_MAINTENANCE = true;
+  };
+};
+```
+
+The root-readable environment file contains only:
+
+```dotenv
+MARIMOHUB_AUTH_OIDC_CLIENT_SECRET=<google-client-secret>
+MARIMOHUB_AUTH_SESSION_SECRET=<at-least-32-random-bytes>
+```
+
+The Google OAuth app must use the External audience when the domain is not a
+Workspace organization. Keep it in Testing and list individual test users during
+setup, or publish it when ready. The Nix module additionally requires an exact
+email or domain allowlist, and selects `MARIMOHUB_DEFAULT_ROLE=none`; add a user
+to `google.allowedEmails` and invite the same verified address to the desired
+project. No Drive, Gmail, Calendar, or other Google API scopes are requested.
+
 ## Local Dex password authentication
 
-The module can run a small, self-hosted Dex password provider. Each configured
+The module can alternatively run a small, self-hosted Dex password provider. Each configured
 Dex account becomes a distinct marimohub identity:
 
 ```nix
@@ -118,12 +160,12 @@ example with:
 - one rootless Podman container per notebook kernel;
 - a Nix-built Python 3.13 + uv + marimo OCI image;
 - private loopback kernel ports proxied through marimohub;
-- self-hosted Dex password authentication over OIDC;
+- direct Google OIDC authentication with minimal scopes;
 - Caddy TLS termination; and
 - only ports 80/443 open.
 
-Copy the example and replace the hub/auth domains, static users, and allowed
-email domains. The sandbox image is built and loaded automatically; it does not require a registry.
+Copy the example and replace the hub domain and Google OAuth client ID. The
+sandbox image is built and loaded automatically; it does not require a registry.
 Put secrets in a root-owned file outside the Nix store. The example expects
 `/run/keys/marimohub.env`, normally materialized at boot by sops-nix, agenix, or
 another secret manager. Generate the session secret with:
@@ -132,10 +174,9 @@ another secret manager. Generate the session secret with:
 $ openssl rand -base64 32
 ```
 
-Set `MARIMOHUB_AUTH_OIDC_CLIENT_SECRET`, `MARIMOHUB_AUTH_SESSION_SECRET`,
-and every configured `DEX_<USER>_PASSWORD_HASH`. The OIDC callback URL is
-`https://<hub-host>/api/auth/callback`; Dex itself is served from the separate
-authentication hostname.
+Set `MARIMOHUB_AUTH_OIDC_CLIENT_SECRET` and `MARIMOHUB_AUTH_SESSION_SECRET`.
+The OIDC callback URL is `https://<hub-host>/api/auth/callback` and must exactly
+match the authorized redirect URI in Google Cloud.
 
 > **Security:** proxy exposure serves notebook code on the application's origin.
 > A malicious notebook can act as the signed-in user. The single-host example is
@@ -151,8 +192,9 @@ authentication hostname.
 
 [`sandbox-image.nix`](./sandbox-image.nix) implements upstream's image contract
 without a Dockerfile or registry. It contains Python 3.13, uv, marimo, Git, a
-POSIX userland, TLS certificates, a writable `/opt/venv`, and a non-root
-`appuser`. Versions are pinned by `flake.lock`.
+POSIX userland, TLS certificates, GCC runtime libraries needed by binary Python
+wheels, a writable `/opt/venv`, and a non-root `appuser`. Versions are pinned by
+`flake.lock`.
 
 Build the OCI archive or load it into your own rootless Podman store:
 
@@ -169,6 +211,47 @@ ranges for the service account, enables its lingering user manager and Podman AP
 socket, loads the image at activation, and places a Podman-backed `docker` command
 on marimohub's private `PATH`. `MARIMOHUB_COMPUTE_BACKEND` remains `"docker"`
 because that is upstream's name for its Docker-compatible CLI adapter.
+
+### NVIDIA GPUs and RAPIDS
+
+On an NVIDIA NixOS host, expose CDI devices to every notebook sandbox with:
+
+```nix
+services.marimohub.podman = {
+  enable = true;
+  nvidia.enable = true;       # defaults to devices = [ "all" ]
+  # nvidia.devices = [ "0" ]; # alternatively restrict every sandbox to GPU 0
+};
+```
+
+This enables NixOS's NVIDIA Container Toolkit and passes CDI names such as
+`nvidia.com/gpu=all` through the downstream Docker adapter. New sessions can run
+`nvidia-smi`; existing containers must be recreated after changing the option.
+Every sandbox receives the configured GPUs, with no scheduler or memory quota,
+so this is intended for a small trusted team.
+
+The image configures uv's official NVIDIA package index and provides
+`install-rapids-singlecell`. On this CUDA 13 image, run that command in a notebook
+terminal; it records dependencies in the notebook's `pyproject.toml` and installs
+the tested rapids-singlecell 0.16.0 / RAPIDS 26.6 wheel set. It uses precompiled
+wheels and requires neither Conda nor Pixi. Validate the
+complete uv install and GPU execution path (a multi-gigabyte first download) with:
+
+```console
+$ nix run .#test-gpu-rapids
+```
+
+The equivalent notebook check is:
+
+```python
+import cupy as cp
+from anndata import AnnData
+import rapids_singlecell as rsc
+
+adata = AnnData(cp.array([[1, 0], [3, 0], [5, 6]], dtype=cp.float32))
+rsc.pp.normalize_total(adata, target_sum=1)
+cp.testing.assert_allclose(adata.X.sum(axis=1), cp.ones(3))
+```
 
 ## Configuration
 
@@ -193,6 +276,15 @@ Module-specific options:
 | `podman.package` | NixOS Podman | Podman client and user service package |
 | `podman.image` | Nix-built image | OCI archive loaded for the service user |
 | `podman.imageReference` | versioned local tag | Image reference passed to marimohub |
+| `podman.devices` | `[]` | Generic host/CDI devices passed to every sandbox |
+| `podman.nvidia.enable` | `false` | Enable NVIDIA CDI and expose configured GPUs |
+| `podman.nvidia.devices` | `[ "all" ]` | NVIDIA CDI selectors granted to every sandbox |
+| `google.enable` | `false` | Enable direct Google OIDC with `openid email` scopes |
+| `google.clientId` | required when enabled | Google OAuth web client ID |
+| `google.redirectUri` | required when enabled | Exact Google callback URI |
+| `google.environmentFile` | `/run/keys/marimohub-google.env` | Google client and session secrets |
+| `google.allowedEmails` | `[]` | Exact verified Google emails permitted to sign in |
+| `google.allowedEmailDomains` | `[]` | Verified Google email domains permitted to sign in |
 | `dex.enable` | `false` | Enable the local Dex password provider |
 | `dex.issuer` | loopback Dex URL | Public OIDC issuer URL |
 | `dex.redirectUri` | loopback callback | Registered marimohub callback URL |

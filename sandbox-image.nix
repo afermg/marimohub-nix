@@ -13,6 +13,10 @@ let
   imageName = "localhost/marimohub-sandbox";
   imageTag = "py${python.pythonVersion}-marimo${marimoVersion}";
   imageReference = "${imageName}:${imageTag}";
+  runtimeLibraryPath = lib.makeLibraryPath [
+    pkgs.stdenv.cc.cc.lib
+    pkgs.zlib
+  ];
 
   dockerArchive = dockerTools.buildLayeredImage {
     name = imageName;
@@ -31,7 +35,9 @@ let
       pkgs.gnused
       pkgs.openssh
       pkgs.procps
+      pkgs.stdenv.cc.cc.lib
       pkgs.uv
+      pkgs.zlib
       python
       pythonEnv
     ];
@@ -49,6 +55,27 @@ let
       root:x:0:
       appuser:x:1000:
       EOF
+      cat > ./etc/profile <<'EOF'
+      # NVIDIA CDI injects driver paths through either an environment variable or
+      # ld.so.conf snippets. Podman exec currently drops the CDI-only variable,
+      # so also recover NixOS driver store paths from the generated snippets.
+      add_driver_library_path() {
+        if [ -n "$NVIDIA_CTK_LIBCUDA_DIR" ]; then
+          LD_LIBRARY_PATH="$NVIDIA_CTK_LIBCUDA_DIR:$LD_LIBRARY_PATH"
+        fi
+        for file in /etc/ld.so.conf.d/*.conf; do
+          [ -r "$file" ] || continue
+          while IFS= read -r directory; do
+            case "$directory" in
+              /nix/store/*) LD_LIBRARY_PATH="$directory:$LD_LIBRARY_PATH" ;;
+            esac
+          done < "$file"
+        done
+        export LD_LIBRARY_PATH
+      }
+      add_driver_library_path
+      unset -f add_driver_library_path
+      EOF
       cat > ./opt/venv/pyvenv.cfg <<'EOF'
       home = ${python}/bin
       include-system-site-packages = false
@@ -64,6 +91,22 @@ let
       EOF
       chmod 0755 ./opt/venv/bin/marimo
 
+      cat > ./opt/venv/bin/install-rapids-singlecell <<'EOF'
+      #!/bin/sh
+      set -eu
+      if [ -f pyproject.toml ]; then
+        exec uv add \
+          'rapids-singlecell-cu13[rapids]==0.16.0' \
+          'cudf-cu13==26.6.*' 'cugraph-cu13==26.6.*' 'cuml-cu13==26.6.*' \
+          'cuvs-cu13==26.6.*' 'librmm-cu13==26.6.*' "$@"
+      fi
+      exec uv pip install --python /opt/venv/bin/python \
+        'rapids-singlecell-cu13[rapids]==0.16.0' \
+        'cudf-cu13==26.6.*' 'cugraph-cu13==26.6.*' 'cuml-cu13==26.6.*' \
+        'cuvs-cu13==26.6.*' 'librmm-cu13==26.6.*' "$@"
+      EOF
+      chmod 0755 ./opt/venv/bin/install-rapids-singlecell
+
       chown -R 1000:1000 ./home/appuser ./opt/venv ./workspace
       chmod 0700 ./home/appuser
       chmod 1777 ./tmp
@@ -75,10 +118,12 @@ let
       Env = [
         "HOME=/home/appuser"
         "LANG=C.UTF-8"
+        "LD_LIBRARY_PATH=${runtimeLibraryPath}"
         "MARIMO_SKIP_UPDATE_CHECK=1"
-        "PATH=/opt/venv/bin:/bin"
+        "PATH=/opt/venv/bin:/bin:/usr/bin"
         "PYTHONPATH=${pythonEnv}/${python.sitePackages}"
         "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+        "UV_EXTRA_INDEX_URL=https://pypi.nvidia.com"
         "UV_LINK_MODE=copy"
         "UV_PROJECT_ENVIRONMENT=/opt/venv"
         "UV_PYTHON_DOWNLOADS=never"

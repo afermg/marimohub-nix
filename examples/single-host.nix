@@ -1,6 +1,6 @@
 # Import this flake's NixOS module and adapt the domains and users. This example
-# keeps notebooks on local disk, authenticates static users through Dex, and runs
-# kernels in rootless Podman containers built reproducibly as a Nix OCI image.
+# keeps notebooks on local disk, authenticates users directly through Google OIDC,
+# and runs kernels in rootless Podman containers built reproducibly as a Nix OCI image.
 { config, ... }:
 
 {
@@ -12,23 +12,20 @@
     # Enables a lingering rootless Podman service for the marimohub account,
     # loads the flake's Nix-built sandbox image, and supplies the Docker-compatible
     # command expected by upstream's `docker` compute adapter.
-    podman.enable = true;
-
-    dex = {
+    podman = {
       enable = true;
-      issuer = "https://auth.example.com/dex";
+      # On an NVIDIA NixOS host, enable CDI passthrough for every kernel:
+      # nvidia.enable = true;
+    };
+
+    google = {
+      enable = true;
+      clientId = "replace-with-google-oauth-client-id.apps.googleusercontent.com";
       redirectUri = "https://hub.example.com/api/auth/callback";
-      allowInsecureHttp = false;
       environmentFile = "/run/keys/marimohub.env";
-      allowedEmailDomains = [ "example.com" ];
-      users = [
-        {
-          email = "alice@example.com";
-          username = "alice";
-          userId = "alice";
-          passwordHashEnv = "DEX_ALICE_PASSWORD_HASH";
-        }
-      ];
+      # Exact addresses allow Gmail and other domains without opening sign-in to
+      # every Google account. Add each person here before inviting them to a project.
+      allowedEmails = [ "alice@example.com" ];
     };
 
     settings = {
@@ -52,9 +49,6 @@
     virtualHosts = {
       "hub.example.com".extraConfig = ''
         reverse_proxy 127.0.0.1:${toString config.services.marimohub.port}
-      '';
-      "auth.example.com".extraConfig = ''
-        reverse_proxy 127.0.0.1:${toString config.services.marimohub.dex.port}
       '';
     };
   };

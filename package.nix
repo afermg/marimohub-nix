@@ -43,7 +43,7 @@ stdenvNoCC.mkDerivation (finalAttrs: {
 
   env.CI = "true";
 
-  patches = [ ./patches/local-oidc-http.patch ];
+  patches = [ ./patches/runtime-integration.patch ];
 
   postPatch = ''
     # Upstream currently listens on every interface. Add a downstream knob so the
@@ -67,6 +67,14 @@ stdenvNoCC.mkDerivation (finalAttrs: {
       build
 
     runHook postBuild
+  '';
+
+  doCheck = true;
+  checkPhase = ''
+    runHook preCheck
+    pnpm --filter @marimo-hub/auth-oidc test
+    pnpm --filter @marimo-hub/compute-docker test
+    runHook postCheck
   '';
 
   installPhase = ''

@@ -38,6 +38,11 @@ let
     };
   };
   defaultSandboxImage = pkgs.callPackage ./sandbox-image.nix { };
+  podmanDevices =
+    cfg.podman.devices
+    ++ lib.optionals cfg.podman.nvidia.enable (
+      map (device: "nvidia.com/gpu=${device}") cfg.podman.nvidia.devices
+    );
   podmanAsDocker = pkgs.writeShellScriptBin "docker" ''
     runtime_dir="/run/user/$(${pkgs.coreutils}/bin/id -u)"
     # The remote client still creates a small libpod runtime directory. Keep it
@@ -192,6 +197,82 @@ in
           together with podman.image when supplying another archive.
         '';
       };
+
+      devices = lib.mkOption {
+        type = lib.types.listOf (lib.types.strMatching "[^,]+");
+        default = [ ];
+        example = [ "/dev/zero:/dev/example-device" ];
+        description = ''
+          Host paths or CDI device names passed separately to `podman run
+          --device` for every notebook sandbox. Prefer podman.nvidia for NVIDIA
+          GPUs. Every sandbox receives every device in this list.
+        '';
+      };
+
+      nvidia = {
+        enable = lib.mkEnableOption "NVIDIA CDI passthrough for every notebook sandbox";
+
+        devices = lib.mkOption {
+          type = lib.types.listOf (lib.types.strMatching "[^,]+");
+          default = [ "all" ];
+          example = [
+            "0"
+            "1"
+          ];
+          description = ''
+            NVIDIA CDI selectors. `all` exposes every GPU; numeric indices and
+            GPU UUIDs can restrict the set. Each value becomes
+            `nvidia.com/gpu=<value>` and is granted to every sandbox.
+          '';
+        };
+      };
+    };
+
+    google = {
+      enable = lib.mkEnableOption "direct Google OIDC authentication";
+
+      clientId = lib.mkOption {
+        type = lib.types.str;
+        description = "Google OAuth web application's client ID.";
+      };
+
+      redirectUri = lib.mkOption {
+        type = lib.types.str;
+        example = "https://hub.example.com/api/auth/callback";
+        description = "Exact callback URI registered in Google Cloud.";
+      };
+
+      environmentFile = lib.mkOption {
+        type = lib.types.str;
+        default = "/run/keys/marimohub-google.env";
+        description = ''
+          Root-readable environment file containing
+          MARIMOHUB_AUTH_OIDC_CLIENT_SECRET and MARIMOHUB_AUTH_SESSION_SECRET.
+        '';
+      };
+
+      allowedEmails = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [
+          "alice@example.com"
+          "bob@gmail.com"
+        ];
+        description = ''
+          Exact verified Google email addresses permitted to sign in. Use this
+          for a private deployment whose invited users have different domains.
+        '';
+      };
+
+      allowedEmailDomains = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "example.com" ];
+        description = ''
+          Verified-email domains permitted to sign in. At least one exact email
+          or domain restriction is required; both restrictions apply when set.
+        '';
+      };
     };
 
     dex = {
@@ -326,6 +407,30 @@ in
         '';
       }
       {
+        assertion = !cfg.podman.nvidia.enable || cfg.podman.enable;
+        message = "services.marimohub.podman.nvidia requires podman.enable=true";
+      }
+      {
+        assertion = !cfg.podman.nvidia.enable || cfg.podman.nvidia.devices != [ ];
+        message = "services.marimohub.podman.nvidia.devices must not be empty";
+      }
+      {
+        assertion = !(cfg.dex.enable && cfg.google.enable);
+        message = "services.marimohub.dex and services.marimohub.google are mutually exclusive";
+      }
+      {
+        assertion = !cfg.google.enable || (cfg.settings.MARIMOHUB_AUTH_BACKEND or null) == "oidc";
+        message = "services.marimohub.google requires MARIMOHUB_AUTH_BACKEND=\"oidc\"";
+      }
+      {
+        assertion =
+          !cfg.google.enable || cfg.google.allowedEmails != [ ] || cfg.google.allowedEmailDomains != [ ];
+        message = ''
+          services.marimohub.google requires at least one allowedEmails or
+          allowedEmailDomains entry so an External Google app is not open to every account.
+        '';
+      }
+      {
         assertion = !cfg.dex.enable || cfg.dex.users != [ ];
         message = "services.marimohub.dex requires at least one static user";
       }
@@ -370,14 +475,38 @@ in
     ];
 
     virtualisation.podman.enable = lib.mkIf cfg.podman.enable true;
+    hardware.nvidia-container-toolkit.enable = lib.mkIf cfg.podman.nvidia.enable true;
 
     services.marimohub.settings = lib.mkMerge [
-      (lib.mkIf cfg.podman.enable {
-        MARIMOHUB_COMPUTE_BACKEND = lib.mkDefault "docker";
-        MARIMOHUB_COMPUTE_IMAGE = lib.mkDefault cfg.podman.imageReference;
-        MARIMOHUB_COMPUTE_DOCKER_HOST = lib.mkDefault "localhost";
-        MARIMOHUB_COMPUTE_DOCKER_BIND_HOST = lib.mkDefault "127.0.0.1";
-      })
+      (lib.mkIf cfg.podman.enable (
+        {
+          MARIMOHUB_COMPUTE_BACKEND = lib.mkDefault "docker";
+          MARIMOHUB_COMPUTE_IMAGE = lib.mkDefault cfg.podman.imageReference;
+          MARIMOHUB_COMPUTE_DOCKER_HOST = lib.mkDefault "localhost";
+          MARIMOHUB_COMPUTE_DOCKER_BIND_HOST = lib.mkDefault "127.0.0.1";
+        }
+        // lib.optionalAttrs (podmanDevices != [ ]) {
+          MARIMOHUB_COMPUTE_DOCKER_DEVICES = lib.mkDefault (lib.concatStringsSep "," podmanDevices);
+        }
+      ))
+      (lib.mkIf cfg.google.enable (
+        {
+          MARIMOHUB_AUTH_BACKEND = lib.mkDefault "oidc";
+          MARIMOHUB_AUTH_OIDC_ISSUER = lib.mkDefault "https://accounts.google.com";
+          MARIMOHUB_AUTH_OIDC_CLIENT_ID = lib.mkDefault cfg.google.clientId;
+          MARIMOHUB_AUTH_OIDC_REDIRECT_URI = lib.mkDefault cfg.google.redirectUri;
+          MARIMOHUB_AUTH_OIDC_SCOPES = lib.mkDefault "openid email";
+          MARIMOHUB_DEFAULT_ROLE = lib.mkDefault "none";
+        }
+        // lib.optionalAttrs (cfg.google.allowedEmails != [ ]) {
+          MARIMOHUB_AUTH_ALLOWED_EMAILS = lib.mkDefault (lib.concatStringsSep "," cfg.google.allowedEmails);
+        }
+        // lib.optionalAttrs (cfg.google.allowedEmailDomains != [ ]) {
+          MARIMOHUB_AUTH_ALLOWED_EMAIL_DOMAINS = lib.mkDefault (
+            lib.concatStringsSep "," cfg.google.allowedEmailDomains
+          );
+        }
+      ))
       (lib.mkIf cfg.dex.enable {
         MARIMOHUB_AUTH_BACKEND = lib.mkDefault "oidc";
         MARIMOHUB_AUTH_OIDC_ISSUER = lib.mkDefault cfg.dex.issuer;
@@ -391,7 +520,10 @@ in
       })
     ];
 
-    services.marimohub.environmentFiles = lib.mkIf cfg.dex.enable [ cfg.dex.environmentFile ];
+    services.marimohub.environmentFiles = lib.mkMerge [
+      (lib.mkIf cfg.google.enable [ cfg.google.environmentFile ])
+      (lib.mkIf cfg.dex.enable [ cfg.dex.environmentFile ])
+    ];
 
     services.dex = lib.mkIf cfg.dex.enable {
       enable = true;
@@ -478,11 +610,13 @@ in
       wants = [ "network-online.target" ];
       requires =
         lib.optional cfg.podman.enable "marimohub-podman-image.service"
+        ++ lib.optional cfg.podman.nvidia.enable "nvidia-container-toolkit-cdi-generator.service"
         ++ lib.optional cfg.dex.enable "dex.service";
       after = [
         "network-online.target"
       ]
       ++ lib.optional cfg.podman.enable "marimohub-podman-image.service"
+      ++ lib.optional cfg.podman.nvidia.enable "nvidia-container-toolkit-cdi-generator.service"
       ++ lib.optional cfg.dex.enable "dex.service";
       path = cfg.runtimePackages ++ lib.optional cfg.podman.enable podmanAsDocker;
 
