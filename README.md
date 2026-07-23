@@ -100,6 +100,71 @@ email or domain allowlist, and selects `MARIMOHUB_DEFAULT_ROLE=none`; add a user
 to `google.allowedEmails` and invite the same verified address to the desired
 project. No Drive, Gmail, Calendar, or other Google API scopes are requested.
 
+### Sharing projects and notebooks
+
+Authentication gives each person a distinct identity; project membership controls
+what that identity can access. A project admin opens the project, selects
+**Members**, and adds the user's verified Google email. The invitation can be
+created before the user first signs in because email matching is case-insensitive.
+Choose the least-privileged suitable role:
+
+| Role | Access |
+| --- | --- |
+| `viewer` | Read notebooks, saved code, outputs, and version history. |
+| `editor` | Viewer access plus create/edit/delete notebooks and start/stop kernels. |
+| `admin` | Editor access plus project settings and membership management. |
+
+With Google's `MARIMOHUB_DEFAULT_ROLE=none`, an authenticated but uninvited user
+cannot see the project. Every editor receives a separate Podman sandbox and Python
+kernel when opening a notebook; refreshing reconnects that user to their own live
+session. Saved notebook versions and outputs are shared through the project, but
+running kernels, variables, and in-memory data are not. Concurrent editors should
+coordinate their changes because this is versioned sharing, not real-time
+Google-Docs-style merging. A viewer either sees the last saved static output (the
+default) or, with `MARIMOHUB_VIEWER_MODE=ephemeral-sandbox`, receives a private
+disposable kernel whose changes are discarded.
+
+### Cloudflare Tunnel as transport only
+
+A Cloudflare Tunnel can publish a loopback-only hub without using Cloudflare for
+authentication. In the tunnel dashboard, create the public hostname
+`hub.example.com` with service URL `http://localhost:3000`. Do **not** create a
+Cloudflare Access application: the tunnel carries HTTPS and WebSockets while
+marimohub authenticates users directly with Google OIDC.
+
+Run the connector with its token outside the Nix store, for example:
+
+```nix
+{ config, pkgs, ... }:
+{
+  users.users.cloudflared = {
+    isSystemUser = true;
+    group = "cloudflared";
+  };
+  users.groups.cloudflared = { };
+
+  systemd.services.cloudflared-marimohub = {
+    description = "Cloudflare Tunnel — marimohub";
+    after = [ "network-online.target" "marimohub.service" ];
+    wants = [ "network-online.target" ];
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = {
+      User = "cloudflared";
+      Group = "cloudflared";
+      EnvironmentFile = "/run/keys/cloudflared-marimohub.env";
+      ExecStart = "${pkgs.cloudflared}/bin/cloudflared --no-autoupdate tunnel run";
+      Restart = "on-failure";
+      RestartSec = "5s";
+    };
+  };
+}
+```
+
+The protected environment file contains `TUNNEL_TOKEN=<connector-token>`. With a
+tunnel, keep marimohub on `127.0.0.1`, do not open ports 80/443, and do not run
+Caddy for this hostname. Google's authorized redirect URI must still exactly match
+`https://hub.example.com/api/auth/callback`.
+
 ## Local Dex password authentication
 
 The module can alternatively run a small, self-hosted Dex password provider. Each configured
